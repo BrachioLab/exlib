@@ -75,26 +75,37 @@ def explain_image_cls_with_kernelShap(model, x, ts,
                                 kernelShapImageExplainerKwargs={},
                                 # Gets FA for every label if top_labels == None
                                 explain_instance_kwargs={},
-                                get_image_and_mask_kwargs={}):
+                                get_image_and_mask_kwargs={},
+                                patch_height=16,
+                                patch_width=16,
+                                nsamples=100,
+                                ):
     """
 
     """
     segmentation_fn = explain_instance_kwargs.get('segmentation_fn')
 
     if segmentation_fn is None:
-        segments = patch_segment(x,patch_height=56,patch_width=56,dtype="torch")
+        segments = patch_segment(x,patch_height=patch_height,patch_width=patch_width,dtype="torch")
 
     else:
         segments = segmentation_fn(x) #Look into providing arguments to this
 
+    # print("segments shape",segments.shape)
     f = lambda z : f_torch(z,x,segments,model)
 
     ## Images here are not batched
     C, H, W = x.shape
     x_np = x.cpu().permute(1,2,0).numpy()
+    # print(len(segments.unique()), segments.max(), segments.min())
+    explainer = shap.KernelExplainer(f, np.zeros((1,len(segments.unique()))), **kernelShapImageExplainerKwargs)
+    
+    # print('segments shape:', segments.shape)
+    # print('np.unique(segments).shape:', np.unique(segments.cpu().numpy()).shape)
+    # print('Input to shap_values:', np.ones((1, np.unique(segments.cpu().numpy()).shape[0])).shape)
 
-    explainer = shap.KernelExplainer(f, np.zeros((1,16)))
-    shap_values = explainer.shap_values(np.ones((1,16)),nsamples=100)
+    # import pdb; pdb.set_trace()
+    shap_values = explainer.shap_values(np.ones((1,len(segments.unique()))),nsamples=nsamples)
 
     if isinstance(ts, torch.Tensor):
         todo_labels = ts.numpy()
@@ -104,11 +115,12 @@ def explain_image_cls_with_kernelShap(model, x, ts,
 
 
 
+    attrs = []
     for t in todo_labels:
         m = fill_segmentation(shap_values[t][0], segments)
-        break #KernelShapImage class only calls this function with single t, so this break should be enough
-
-    return FeatureAttrOutput(m, explainer)
+        attrs.append(m)
+    attrs = torch.stack(attrs)
+    return FeatureAttrOutput(attrs, explainer)
 
 
 
@@ -117,11 +129,18 @@ class KernelShapImageCls(FeatureAttrMethod):
                  KernelShapImageExplainerKwargs={},
                  explain_instance_kwargs={
                  },
-                 get_image_and_mask_kwargs={}):
+                 get_image_and_mask_kwargs={},
+                 patch_height=16,
+                 patch_width=16,
+                 nsamples=100,
+                 ):
         super(KernelShapImageCls, self).__init__(model)
         self.KernelShapImageExplainerKwargs = KernelShapImageExplainerKwargs
         self.explain_instance_kwargs = explain_instance_kwargs
         self.get_image_and_mask_kwargs = get_image_and_mask_kwargs
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+        self.nsamples = nsamples
 
 
     def forward(self, x, t):
@@ -129,19 +148,29 @@ class KernelShapImageCls(FeatureAttrMethod):
             t = torch.tensor(t)
 
         N = x.size(0)
-        assert x.ndim == 4 and t.ndim == 1 and len(t) == N
+        assert x.ndim == 4 and len(t) == N
+        if t.ndim == 1:
+            t = t.unsqueeze(1)
+        assert t.ndim == 2
 
         attrs, kshap_exps = [], []
         for i in range(N):
-            xi, ti = x[i], t[i].cpu().item()
-            out = explain_image_cls_with_kernelShap(self.model, xi, [ti],
+            xi, ti = x[i], t[i]
+            out = explain_image_cls_with_kernelShap(self.model, xi, ti.cpu().numpy().tolist(),
                     kernelShapImageExplainerKwargs=self.KernelShapImageExplainerKwargs,
                     explain_instance_kwargs=self.explain_instance_kwargs,
-                    get_image_and_mask_kwargs=self.get_image_and_mask_kwargs)
+                    get_image_and_mask_kwargs=self.get_image_and_mask_kwargs, 
+                    patch_height=self.patch_height,
+                    patch_width=self.patch_width,
+                    nsamples=self.nsamples,
+                    )
 
-            attrs.append(out.attributions.unsqueeze(0).repeat(3,1,1))
+            attrs.append(out.attributions.permute(1,2,0).unsqueeze(0)) #.repeat(3,1,1))
             kshap_exps.append(out.explainer_output)
 
+        attrs = torch.stack(attrs, dim=0)
+        if attrs.ndim == 5 and attrs.size(-1) == 1:
+            attrs = attrs.squeeze(-1)
 
-        return FeatureAttrOutput(torch.stack(attrs), kshap_exps)
+        return FeatureAttrOutput(attrs, kshap_exps)
 

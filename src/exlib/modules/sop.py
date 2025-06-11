@@ -830,7 +830,7 @@ class SOPTextCls(SOPText):
         masks_max_pred_cls = masks_mult_pred[range(bsz),max_mask_indices]
 
         # import pdb; pdb.set_trace()
-        flat_masks = compress_masks_text(input_mask_weights, output_mask_weights[:,:,predicted])
+        # flat_masks = compress_masks_text(input_mask_weights, output_mask_weights[:,:,predicted])
         
         return AttributionOutputSOP(weighted_logits,
                                     logits,

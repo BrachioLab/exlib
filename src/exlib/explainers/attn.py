@@ -17,7 +17,7 @@ class AttnImageCls(FeatureAttrMethod):
         self.projection_up.weight.requires_grad = False
         self.projection_up.bias.requires_grad = False
         
-    def forward(self, x, labels=None, kwargs={}):
+    def forward(self, x, labels=None, kwargs={}, return_groups=False):
         self.model.eval()
         with torch.no_grad():
             original_outputs = self.model(x, **self.attn_kwargs, **kwargs)
@@ -28,6 +28,9 @@ class AttnImageCls(FeatureAttrMethod):
         attn = self.projection_up(attn, output_size=torch.Size([attn.shape[0], 1, 
                                                                 self.img_dim, 
                                                                 self.img_dim]))
+        # import pdb; pdb.set_trace()
+        if labels.shape[-1] != 1:
+            attn = attn.unsqueeze(-1).repeat(1, 1, 1, 1, labels.shape[-1])
         return FeatureAttrOutput(attn, {})
 
 
@@ -46,7 +49,7 @@ class AttnTextCls(FeatureAttrMethod):
         # self.projection_up.weight.requires_grad = False
         # self.projection_up.bias.requires_grad = False
         
-    def forward(self, x, labels=None, kwargs={}):
+    def forward(self, x, labels=None, kwargs={}, return_groups=False):
         self.model.eval()
         with torch.no_grad():
             original_outputs = self.model(x, **self.attn_kwargs, **kwargs)
