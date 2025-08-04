@@ -7,6 +7,9 @@ except ImportError:
 import torch
 import torch.nn as nn
 import numpy as np
+from exlib.new_explainers import ShapImage, ShapText, ShapExplanation
+from fixtures.models import get_vision_model, get_text_model
+from fixtures.data import get_test_image, get_test_text_inputs
 
 
 class TestShapImage:

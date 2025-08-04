@@ -85,7 +85,8 @@ class ShapImage:
         model: nn.Module,
         input: torch.Tensor,
         target: Optional[int] = None,
-        return_coalitions: bool = False
+        return_coalitions: bool = False,
+        batch_size: int = 16
     ) -> ShapExplanation:
         """Generate SHAP explanation for an image.
         
@@ -102,7 +103,6 @@ class ShapImage:
         if input.dim() == 4:
             input = input[0]
         
-        device = input.device
         original_mode = model.training
         model.eval()
         
@@ -120,10 +120,7 @@ class ShapImage:
         with torch.no_grad():
             # Original prediction
             output = model(input.unsqueeze(0))
-            if hasattr(output, 'logits'):
-                logits = output.logits
-            else:
-                logits = output
+            logits = getattr(output, 'logits', output)
             
             if target is None:
                 target = logits.argmax(dim=1).item()
@@ -147,26 +144,27 @@ class ShapImage:
         coalitions[1, :] = 1  # Full coalition
         
         # Get predictions for coalitions
-        predictions = []
+        masked_images = []
+
         for i in range(self.n_samples):
             coalition = coalitions[i]
-            
-            # Create masked input
             masked = baseline_img.clone()
             for seg_id in range(n_features):
                 if coalition[seg_id] == 1:
-                    # Include this segment from original
                     masked[:, segments == seg_id] = input[:, segments == seg_id]
-            
-            with torch.no_grad():
-                output = model(masked.unsqueeze(0))
-                if hasattr(output, 'logits'):
-                    logits = output.logits
-                else:
-                    logits = output
-                prob = torch.softmax(logits, dim=1)[0, target].item()
-                predictions.append(prob)
-        
+            masked_images.append(masked)
+
+        # Stack all masked images into a batch
+        masked_images_tensor = torch.stack(masked_images, dim=0).to(input.device)
+
+        predictions = []
+        with torch.no_grad():
+            for batch in torch.split(masked_images_tensor, batch_size, dim=0):
+                output = model(batch)
+                logits = getattr(output, 'logits', output)
+                probs = torch.softmax(logits, dim=1)[:, target]
+                predictions.extend(probs.cpu().numpy())
+
         predictions = np.array(predictions)
         
         # Compute KernelSHAP weights
@@ -257,7 +255,8 @@ class ShapText:
         model: nn.Module,
         input_ids: torch.Tensor,
         target: Optional[int] = None,
-        return_coalitions: bool = False
+        return_coalitions: bool = False,
+        batch_size: int = 16
     ) -> ShapExplanation:
         """Generate SHAP explanation for text.
         
@@ -282,10 +281,7 @@ class ShapText:
         # Get original prediction
         with torch.no_grad():
             output = model(input_ids.unsqueeze(0))
-            if hasattr(output, 'logits'):
-                logits = output.logits
-            else:
-                logits = output
+            logits = getattr(output, 'logits', output)
             
             if target is None:
                 target = logits.argmax(dim=1).item()
@@ -310,37 +306,34 @@ class ShapText:
         # Always include empty and full masks
         masks[0, :] = 0  # All masked
         masks[1, :] = 1  # None masked
-        
-        # Get predictions and weights
-        predictions = []
+        # Batched evaluation for efficiency
+        # Prepare all masked inputs in a batch
+        masked_inputs = []
         weights = []
-        
+
         for i in range(self.n_samples):
             mask = masks[i]
-            
-            # Create masked input
             masked_ids = input_ids.clone()
             mask_indices = torch.tensor(mask == 0, device=device)
             masked_ids[mask_indices] = self.mask_token_id
-            
-            # Get prediction
-            with torch.no_grad():
-                output = model(masked_ids.unsqueeze(0))
-                if hasattr(output, 'logits'):
-                    logits = output.logits
-                else:
-                    logits = output
-                prob = torch.softmax(logits, dim=1)[0, target].item()
-                predictions.append(prob)
-            
-            # Compute weight
+            masked_inputs.append(masked_ids)
             S = mask.sum()
             weight = self._shapley_kernel_weight(seq_len, S)
             weights.append(weight)
-        
+
+        # Stack all masked inputs into a batch
+        masked_inputs_tensor = torch.stack(masked_inputs, dim=0)  # [n_samples, seq_len]
+
+        # Batched model evaluation
+        predictions = []
+        for batch in torch.split(masked_inputs_tensor, batch_size, dim=0):
+            with torch.no_grad():
+                output = model(batch)
+                logits = getattr(output, 'logits', output)
+                probs = torch.softmax(logits, dim=1)[:, target]
+                predictions.extend(probs.cpu().numpy())
         predictions = np.array(predictions)
         weights = np.array(weights)
-        
         # Fit weighted linear regression
         X = np.column_stack([np.ones(self.n_samples), masks])
         

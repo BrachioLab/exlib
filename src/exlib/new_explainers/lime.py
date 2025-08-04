@@ -61,7 +61,8 @@ class LimeImage:
         model: nn.Module,
         input: torch.Tensor,
         target: Optional[int] = None,
-        return_local_model: bool = False
+        return_local_model: bool = False,
+        batch_size: int = 16
     ) -> LimeExplanation:
         """Generate LIME explanation for an image."""
         device = input.device
@@ -85,20 +86,29 @@ class LimeImage:
         masks = np.random.binomial(1, 0.5, size=(self.n_samples, n_features))
         masks[0] = 1  # Ensure original image is included
 
-        # Perturb images and collect predictions
+        # Perturb images and collect predictions (batched, using torch.split)
         predictions = []
         perturbed_images = []
+
+        # Prepare all perturbed images in a list
         for mask in masks:
             perturbed = input.clone()
             for seg_id in range(n_features):
                 if not mask[seg_id]:
                     perturbed[:, segments == seg_id] = 0
             perturbed_images.append(perturbed)
-            with torch.no_grad():
-                out = model(perturbed.unsqueeze(0))
+
+        # Stack all perturbed images into a batch
+        perturbed_images_tensor = torch.stack(perturbed_images, dim=0).to(device)
+
+        # Batched model evaluation using torch.split
+        with torch.no_grad():
+            for batch in torch.split(perturbed_images_tensor, batch_size, dim=0):
+                out = model(batch)
                 logits = getattr(out, 'logits', out)
-                prob = torch.softmax(logits, dim=1)[0, target].item()
-                predictions.append(prob)
+                probs = torch.softmax(logits, dim=1)[:, target]
+                predictions.extend(probs.cpu().numpy())
+
         predictions = np.array(predictions)
 
         # Compute distances and kernel weights
@@ -170,7 +180,8 @@ class LimeText:
         model: nn.Module,
         input_ids: torch.Tensor,
         target: Optional[int] = None,
-        return_local_model: bool = False
+        return_local_model: bool = False,
+        batch_size: int = 16
     ) -> LimeExplanation:
         """Generate LIME explanation for text.
 
@@ -208,17 +219,23 @@ class LimeText:
         # Get predictions for perturbed samples
         predictions = []
         perturbed_inputs = []
+        # Batched evaluation using torch.split for speedup
+        perturbed_inputs = []
         for i in range(self.n_samples):
             mask = masks[i]
             perturbed_ids = input_ids.clone()
             mask_indices = torch.tensor(mask == 0, device=device)
             perturbed_ids[mask_indices] = self.mask_token_id
             perturbed_inputs.append(perturbed_ids)
+        perturbed_inputs_tensor = torch.stack(perturbed_inputs, dim=0)  # [n_samples, seq_len]
+
+        predictions = []
+        for batch in torch.split(perturbed_inputs_tensor, batch_size, dim=0):
             with torch.no_grad():
-                out = model(perturbed_ids.unsqueeze(0))
+                out = model(batch)
                 logits = getattr(out, 'logits', out)
-                prob = torch.softmax(logits, dim=1)[0, target].item()
-                predictions.append(prob)
+                probs = torch.softmax(logits, dim=1)[:, target]
+                predictions.extend(probs.cpu().numpy())
         predictions = np.array(predictions)
 
         # Compute distances and kernel weights
