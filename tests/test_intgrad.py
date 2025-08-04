@@ -6,8 +6,9 @@ except ImportError:
     
 import torch
 import torch.nn as nn
-from src.exlib.new_explainers import IntGradImage, IntGradText, IntGradExplanation
-from tests.fixtures import get_vision_model, get_text_model, get_test_image, get_test_text_inputs
+from exlib.new_explainers import IntGradImage, IntGradText, IntGradExplanation
+from fixtures.models import get_vision_model, get_text_model
+from fixtures.data import get_test_image, get_test_text_inputs
 
 class TestIntGradImage:
     """Test IntGradImage explainer."""
@@ -27,9 +28,15 @@ class TestIntGradImage:
         # Check attribution shape
         assert explanation.attributions.shape == input.shape
         
+        # Check segments field
+        assert hasattr(explanation, 'segments')
+        assert explanation.segments is not None
+        assert explanation.segments.shape == input.shape
+        
         # Check metadata
         assert "target" in explanation.metadata
         assert explanation.metadata["n_steps"] == 10
+        assert "num_segments" in explanation.metadata
     
     def test_with_target(self, model_name="resnet50"):
         """Test explanation with specific target."""
@@ -88,6 +95,54 @@ class TestIntGradImage:
         explanation = explainer.explain(model, input)
         
         assert explanation.attributions.shape == input.shape
+    
+    def test_segments_properties(self):
+        """Test segments tensor properties."""
+        model, config = get_vision_model("resnet50")
+        
+        input = get_test_image(size=config["input_size"])
+        explainer = IntGradImage(n_steps=10, patch_size=16)
+        
+        explanation = explainer.explain(model, input)
+        
+        # Check shape matches input
+        assert explanation.segments.shape == input.shape
+        
+        # Check integer values
+        assert explanation.segments.dtype == torch.long
+        
+        # Check value range
+        unique_segments = explanation.segments.unique()
+        assert unique_segments.min() >= 0
+        expected_max = (input.shape[1] // 16) * (input.shape[2] // 16) - 1
+        assert unique_segments.max() <= expected_max
+        
+        # Check all channels have same segmentation
+        for c in range(input.shape[0]):
+            assert torch.allclose(explanation.segments[0], explanation.segments[c])
+    
+    def test_custom_segmentation(self):
+        """Test with custom segmentation function."""
+        model, config = get_vision_model("resnet50")
+        
+        input = get_test_image(size=config["input_size"])
+        
+        def custom_segmentation(image):
+            # Simple 2x2 grid segmentation
+            h, w = image.shape[1], image.shape[2]
+            segments = torch.zeros(h, w, dtype=torch.long)
+            segments[:h//2, :w//2] = 0
+            segments[:h//2, w//2:] = 1
+            segments[h//2:, :w//2] = 2
+            segments[h//2:, w//2:] = 3
+            return segments
+        
+        explainer = IntGradImage(n_steps=10, segmentation_fn=custom_segmentation)
+        explanation = explainer.explain(model, input)
+        
+        # Verify custom segmentation was used
+        assert explanation.segments[0].unique().numel() == 4
+        assert explanation.metadata['num_segments'] == 4
 
 
 class TestIntGradText:
@@ -114,9 +169,18 @@ class TestIntGradText:
         assert isinstance(explanation, IntGradExplanation)
         assert explanation.attributions.shape == (input_ids.shape[0],)  # seq_len
         
+        # Check segments field for text
+        assert hasattr(explanation, 'segments')
+        assert explanation.segments is not None
+        assert explanation.segments.shape == input_ids.shape
+        # Each token should be its own segment
+        expected_segments = torch.arange(len(input_ids))
+        assert torch.allclose(explanation.segments, expected_segments)
+        
         # Check metadata
         assert "target" in explanation.metadata
         assert explanation.metadata["n_steps"] == 10
+        assert explanation.metadata["num_segments"] == len(input_ids)
     
     def test_with_target(self):
         """Test with specific target class."""
@@ -159,6 +223,36 @@ class TestIntGradText:
         
         assert explanation.convergence_delta is not None
         assert isinstance(explanation.convergence_delta, float)
+    
+    def test_quickshift_segmentation(self):
+        """Test with quickshift segmentation from skimage."""
+        try:
+            from skimage.segmentation import quickshift
+            import numpy as np
+        except ImportError:
+            # Skip test if skimage not available
+            return
+        
+        model, config = get_vision_model("resnet50")
+        input = get_test_image(size=(3, 224, 224))  # Ensure standard size
+        
+        def quickshift_segmentation(image):
+            # Convert to numpy (H, W, C) format for skimage
+            img_np = image.permute(1, 2, 0).cpu().numpy()
+            # Normalize to [0, 1] range for quickshift
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            # Run quickshift
+            segments = quickshift(img_np, kernel_size=3, max_dist=200, ratio=0.2)
+            return torch.tensor(segments, device=image.device, dtype=torch.long)
+        
+        explainer = IntGradImage(n_steps=10, segmentation_fn=quickshift_segmentation)
+        explanation = explainer.explain(model, input)
+        
+        # Check that quickshift created segments
+        assert hasattr(explanation, 'segments')
+        assert explanation.segments.shape == input.shape
+        # Quickshift usually creates many segments
+        assert explanation.metadata['num_segments'] > 10
 
 
 if __name__ == "__main__":

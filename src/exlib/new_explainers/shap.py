@@ -17,6 +17,7 @@ from itertools import combinations
 class ShapExplanation:
     """SHAP-specific explanation output."""
     attributions: torch.Tensor
+    segments: torch.Tensor  # Same shape as input, values in [0, num_segments-1]
     expected_value: float  # Expected output value
     base_value: Optional[float] = None  # Actual baseline output
     coalitions: Optional[dict] = None  # Coalition information for debugging
@@ -31,48 +32,28 @@ class ShapImage:
     """SHAP explainer for image models using KernelSHAP approach.
     
     Usage:
-        explainer = ShapImage(n_samples=100, n_segments=10)
+        explainer = ShapImage(n_samples=100, patch_size=16)
         explanation = explainer.explain(model, image, target=5)
     """
     
     def __init__(
         self,
         n_samples: int = 1000,
-        n_segments: int = 10,
         baseline: Union[str, torch.Tensor] = "zero",
         segmentation_fn: Optional[Callable] = None,
+        patch_size: int = 16,
         random_seed: int = 42
     ):
         self.n_samples = n_samples
-        self.n_segments = n_segments
         self.baseline = baseline
-        self.segmentation_fn = segmentation_fn or self._default_segmentation
+        self.segmentation_fn = segmentation_fn
+        self.patch_size = patch_size
         self.random_seed = random_seed
     
     def _default_segmentation(self, image: torch.Tensor) -> torch.Tensor:
-        """Simple grid-based segmentation."""
-        # Convert to numpy for processing
-        if image.dim() == 3:  # C, H, W
-            _, h, w = image.shape
-        else:  # Batch dimension
-            _, _, h, w = image.shape
-            
-        # Create grid segments
-        segments = torch.zeros((h, w), dtype=torch.long)
-        seg_h = h // int(np.sqrt(self.n_segments))
-        seg_w = w // int(np.sqrt(self.n_segments))
-        
-        seg_id = 0
-        for i in range(0, h, seg_h):
-            for j in range(0, w, seg_w):
-                segments[i:i+seg_h, j:j+seg_w] = seg_id
-                seg_id += 1
-                if seg_id >= self.n_segments:
-                    break
-            if seg_id >= self.n_segments:
-                break
-                
-        return segments
+        """Use patch-based segmentation by default."""
+        from .utils.masking import patch_segment_image
+        return patch_segment_image(image, self.patch_size)
     
     def _get_baseline_image(self, image: torch.Tensor) -> torch.Tensor:
         """Get baseline image based on configuration."""
@@ -126,7 +107,10 @@ class ShapImage:
         model.eval()
         
         # Get segmentation
-        segments = self.segmentation_fn(input)
+        if self.segmentation_fn is not None:
+            segments = self.segmentation_fn(input)
+        else:
+            segments = self._default_segmentation(input)
         n_features = segments.max().item() + 1
         
         # Get baseline
@@ -218,9 +202,14 @@ class ShapImage:
         
         model.train(original_mode)
         
+        # Expand segments to match input shape
+        # segments is (H, W), need to expand to (C, H, W)
+        segments_expanded = segments.unsqueeze(0).expand(input.shape[0], -1, -1)
+        
         # Build explanation
         explanation = ShapExplanation(
             attributions=attributions,
+            segments=segments_expanded,
             expected_value=expected_value,
             base_value=baseline_prob,
             coalitions={'coalitions': coalitions, 'predictions': predictions} if return_coalitions else None,
@@ -228,8 +217,9 @@ class ShapImage:
                 'target': target,
                 'original_probability': original_prob,
                 'n_samples': self.n_samples,
-                'n_segments': n_features,
-                'baseline_type': self.baseline if isinstance(self.baseline, str) else 'custom'
+                'baseline_type': self.baseline if isinstance(self.baseline, str) else 'custom',
+                'num_segments': n_features,
+                'patch_size': self.patch_size
             }
         )
         
@@ -375,9 +365,13 @@ class ShapText:
         
         model.train(original_mode)
         
+        # For text, each token is its own segment
+        segments = torch.arange(len(attributions), device=device)
+        
         # Build explanation
         explanation = ShapExplanation(
             attributions=attributions,
+            segments=segments,
             expected_value=expected_value,
             base_value=baseline_prob,
             coalitions={'masks': masks, 'predictions': predictions} if return_coalitions else None,
@@ -385,7 +379,8 @@ class ShapText:
                 'target': target,
                 'original_probability': original_prob,
                 'n_samples': self.n_samples,
-                'mask_token_id': self.mask_token_id
+                'mask_token_id': self.mask_token_id,
+                'num_segments': len(attributions)
             }
         )
         

@@ -8,6 +8,7 @@ from tqdm import tqdm
 class IntGradExplanation:
     """Integrated Gradients explanation results."""
     attributions: torch.Tensor
+    segments: torch.Tensor  # Same shape as input, values in [0, num_segments-1]
     metadata: dict = None
     convergence_delta: Optional[float] = None
 
@@ -17,7 +18,9 @@ class IntGradImage:
     def __init__(
         self, 
         n_steps: int = 50,
-        baseline: Union[str, torch.Tensor, Callable] = "zero"
+        baseline: Union[str, torch.Tensor, Callable] = "zero",
+        patch_size: int = 16,  # Default to patch-level (set to 1 for pixel-level)
+        segmentation_fn: Optional[Callable] = None
     ):
         """
         Args:
@@ -27,9 +30,15 @@ class IntGradImage:
                 - "mean": Dataset mean (will use 0.5 for each channel)
                 - torch.Tensor: Custom baseline image
                 - Callable: Function that takes input and returns baseline
+            patch_size: Size of patches for attribution aggregation (default: 16)
+                - Set to 1 for pixel-level attributions
+                - Set to larger values for patch-level attributions
+            segmentation_fn: Optional custom segmentation function
         """
         self.n_steps = n_steps
         self.baseline = baseline
+        self.patch_size = patch_size
+        self.segmentation_fn = segmentation_fn
     
     def explain(
         self,
@@ -72,24 +81,57 @@ class IntGradImage:
         # Create baseline
         baseline = self._get_baseline(input)
         
+        # Create segments using custom function or default
+        if self.segmentation_fn is not None:
+            segments = self.segmentation_fn(input)
+        else:
+            from .utils.masking import patch_segment_image
+            segments = patch_segment_image(input, self.patch_size)
+        
         # Compute integrated gradients
-        attributions = self._integrate_gradients(
+        pixel_attributions = self._integrate_gradients(
             model, input, baseline, target
         )
+        
+        # Aggregate attributions at patch level (unless patch_size=1)
+        if self.patch_size > 1 or self.segmentation_fn is not None:
+            # Average attributions within each segment
+            n_segments = segments.max().item() + 1
+            aggregated_attributions = torch.zeros_like(input)
+            
+            for seg_id in range(n_segments):
+                mask = segments == seg_id
+                # For each channel, compute mean attribution for this segment
+                for c in range(input.shape[0]):
+                    if mask.any():
+                        mean_attr = pixel_attributions[c, mask].mean()
+                        aggregated_attributions[c, mask] = mean_attr
+            
+            attributions = aggregated_attributions
+        else:
+            # patch_size=1, keep pixel-level attributions
+            attributions = pixel_attributions
         
         # Compute convergence delta if requested
         convergence_delta = None
         if return_convergence_delta:
             convergence_delta = self._compute_convergence_delta(
-                model, input, baseline, attributions, target
+                model, input, baseline, pixel_attributions, target  # Use pixel-level for convergence
             )
+        
+        # Expand segments to match input shape (add channel dimension)
+        # segments is (H, W), need to expand to (C, H, W)
+        segments_expanded = segments.unsqueeze(0).expand(input.shape[0], -1, -1)
         
         return IntGradExplanation(
             attributions=attributions,
+            segments=segments_expanded,
             metadata={
                 "target": target,
                 "n_steps": self.n_steps,
-                "baseline_type": self.baseline if isinstance(self.baseline, str) else "custom"
+                "baseline_type": self.baseline if isinstance(self.baseline, str) else "custom",
+                "num_segments": segments.max().item() + 1,
+                "patch_size": self.patch_size
             },
             convergence_delta=convergence_delta
         )
@@ -267,12 +309,17 @@ class IntGradText:
                 model, input_batch, baseline_embeds, embeds_grads, target
             )
         
+        # For text, each token is its own segment
+        segments = torch.arange(len(attributions), device=attributions.device)
+        
         return IntGradExplanation(
             attributions=attributions,
+            segments=segments,
             metadata={
                 "target": target,
                 "n_steps": self.n_steps,
-                "baseline": self.baseline
+                "baseline": self.baseline,
+                "num_segments": len(attributions)
             },
             convergence_delta=convergence_delta
         )

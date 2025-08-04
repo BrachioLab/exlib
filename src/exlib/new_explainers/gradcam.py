@@ -16,6 +16,7 @@ import torch.nn.functional as F
 class GradCAMExplanation:
     """GradCAM-specific explanation output."""
     attributions: torch.Tensor  # Heatmap
+    segments: torch.Tensor  # Same shape as input, values in [0, num_segments-1]
     activations: Optional[torch.Tensor] = None  # Raw activations
     gradients: Optional[torch.Tensor] = None    # Raw gradients
     metadata: dict = None
@@ -38,7 +39,9 @@ class GradCAMImage:
         layer_name: Optional[str] = None,
         layer: Optional[nn.Module] = None,
         use_relu: bool = True,
-        eps: float = 1e-8
+        eps: float = 1e-8,
+        patch_size: int = 16,
+        segmentation_fn: Optional[Callable] = None
     ):
         """Initialize GradCAM explainer.
         
@@ -52,6 +55,8 @@ class GradCAMImage:
         self.layer = layer
         self.use_relu = use_relu
         self.eps = eps
+        self.patch_size = patch_size
+        self.segmentation_fn = segmentation_fn
         self.activations = None
         self.gradients = None
         
@@ -171,12 +176,7 @@ class GradCAMImage:
             
             # Remove batch dimension for output
             cam = cam.squeeze(0)  # [1, H, W]
-            
-            # Expand to match input channels
-            if input.dim() == 4:
-                attributions = cam.expand(input.shape[1], -1, -1)
-            else:
-                attributions = cam.expand_as(input)
+            pixel_cam = cam.squeeze(0)  # [H, W] for aggregation
             
         finally:
             # Remove hooks
@@ -184,9 +184,39 @@ class GradCAMImage:
             gradient_hook.remove()
             model.train(original_mode)
         
+        # Create segments using custom function or default
+        if self.segmentation_fn is not None:
+            segments = self.segmentation_fn(input.squeeze(0))
+        else:
+            from .utils.masking import patch_segment_image
+            segments = patch_segment_image(input.squeeze(0), self.patch_size)
+        
+        # Aggregate CAM values at segment level (unless patch_size=1)
+        if self.patch_size > 1 or self.segmentation_fn is not None:
+            # Average CAM values within each segment
+            n_segments = segments.max().item() + 1
+            aggregated_cam = torch.zeros_like(pixel_cam)
+            
+            for seg_id in range(n_segments):
+                mask = segments == seg_id
+                if mask.any():
+                    mean_cam = pixel_cam[mask].mean()
+                    aggregated_cam[mask] = mean_cam
+            
+            # Expand to match input channels
+            attributions = aggregated_cam.unsqueeze(0).expand(input.shape[1], -1, -1)
+        else:
+            # patch_size=1, keep pixel-level CAM
+            attributions = cam.expand(input.shape[1], -1, -1)
+        
+        # Expand segments to match input shape
+        # segments is (H, W), need to expand to (C, H, W)
+        segments_expanded = segments.unsqueeze(0).expand(input.shape[1], -1, -1)
+        
         # Build explanation
         explanation = GradCAMExplanation(
             attributions=attributions,
+            segments=segments_expanded,
             activations=self.activations if return_raw else None,
             gradients=self.gradients if return_raw else None,
             metadata={
@@ -194,7 +224,9 @@ class GradCAMImage:
                 'layer_name': self.layer_name,
                 'use_relu': self.use_relu,
                 'cam_shape': cam.shape,
-                'auto_selected': self.auto_select
+                'auto_selected': self.auto_select,
+                'num_segments': segments.max().item() + 1,
+                'patch_size': self.patch_size
             }
         )
         
@@ -346,16 +378,21 @@ class GradCAMText:
         
         model.train(original_mode)
         
+        # For text, each token is its own segment
+        segments = torch.arange(len(importance_scores), device=device)
+        
         # Build explanation
         explanation = GradCAMExplanation(
             attributions=importance_scores,
+            segments=segments,
             activations=inputs_embeds.detach() if return_raw else None,
             gradients=embedding_gradients if return_raw else None,
             metadata={
                 'target': target,
                 'method': 'embedding_gradients',
                 'use_relu': self.use_relu,
-                'seq_len': seq_len
+                'seq_len': seq_len,
+                'num_segments': len(importance_scores)
             }
         )
         

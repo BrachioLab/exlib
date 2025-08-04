@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 class LimeExplanation:
     """LIME-specific explanation output."""
     attributions: torch.Tensor
-    segments: Optional[torch.Tensor] = None  # For image segmentation
+    segments: torch.Tensor  # Required: Same shape as input
     local_model: Optional[object] = None    # The fitted Ridge model
     r2_score: Optional[float] = None        # Model fit quality
     metadata: dict = None
@@ -33,43 +33,34 @@ class LimeImage:
     """LIME explainer for image models.
 
     Usage:
-        explainer = LimeImage(n_samples=100, n_segments=10)
+        explainer = LimeImage(n_samples=100, patch_size=16)
         explanation = explainer.explain(model, image, target=5)
     """
 
     def __init__(
         self,
         n_samples: int = 1000,
-        n_segments: int = 10,
-        kernel_width: float = 25.0,  # Appropriate for L2 distance in pixel space
+        kernel_width: float = 40.0,  # Appropriate for L2 distance in pixel space
         random_seed: int = 42,
-        segmentation_fn: Optional[Callable] = None
+        segmentation_fn: Optional[Callable] = None,
+        patch_size: int = 16
     ):
         self.n_samples = n_samples
-        self.n_segments = n_segments
         self.kernel_width = kernel_width
+        self.patch_size = patch_size
         self.random_seed = random_seed
         self.segmentation_fn = segmentation_fn or self._default_segmentation
 
     def _default_segmentation(self, image: torch.Tensor) -> torch.Tensor:
-        """Simple grid-based segmentation."""
-        _, h, w = image.shape
-        grid_size = int(np.sqrt(self.n_segments))
-        seg_h, seg_w = h // grid_size, w // grid_size
-        segment_ids = torch.arange(seg_h * seg_w, dtype=torch.long).view(seg_h, seg_w)
-        segments = F.interpolate(
-            segment_ids[None, None].float(),
-            size=(h, w),
-            mode='nearest'
-        ).view(h, w).long()
-        return segments
+        """Use patch-based segmentation by default."""
+        from .utils.masking import patch_segment_image
+        return patch_segment_image(image, self.patch_size)
 
     def explain(
         self,
         model: nn.Module,
         input: torch.Tensor,
         target: Optional[int] = None,
-        return_segments: bool = False,
         return_local_model: bool = False
     ) -> LimeExplanation:
         """Generate LIME explanation for an image."""
@@ -134,17 +125,21 @@ class LimeImage:
 
         model.train(original_mode)
 
+        # Expand segments to match input shape
+        # segments is (H, W), need to expand to (C, H, W)
+        segments_expanded = segments.unsqueeze(0).expand(input.shape[0], -1, -1)
+        
         return LimeExplanation(
             attributions=attributions,
-            segments=segments if return_segments else None,
+            segments=segments_expanded,
             local_model=ridge if return_local_model else None,
             r2_score=r2,
             metadata={
                 'target': target,
                 'base_probability': base_prob,
                 'n_samples': self.n_samples,
-                'n_segments': n_features,
-                'kernel_width': self.kernel_width
+                'kernel_width': self.kernel_width,
+                'num_segments': n_features
             }
         )
 
@@ -245,9 +240,13 @@ class LimeText:
 
         model.train(original_mode)
 
+        # For text, each token is its own segment
+        segments = torch.arange(len(attributions), device=device)
+        
         # Build explanation
         explanation = LimeExplanation(
             attributions=attributions,
+            segments=segments,
             local_model=ridge if return_local_model else None,
             r2_score=r2,
             metadata={
@@ -255,7 +254,8 @@ class LimeText:
                 'base_probability': base_prob,
                 'n_samples': self.n_samples,
                 'kernel_width': self.kernel_width,
-                'mask_token_id': self.mask_token_id
+                'mask_token_id': self.mask_token_id,
+                'num_segments': len(attributions)
             }
         )
 
