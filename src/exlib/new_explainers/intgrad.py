@@ -252,7 +252,7 @@ class IntGradText:
     def explain(
         self,
         model: nn.Module,
-        input: torch.Tensor,
+        input_ids: torch.Tensor,
         target: Optional[int] = None,
         return_convergence_delta: bool = False
     ) -> IntGradExplanation:
@@ -268,28 +268,26 @@ class IntGradText:
             IntGradExplanation with attributions
         """
         # Ensure we have token IDs
-        if input.dtype not in [torch.long, torch.int]:
+        if input_ids.dtype not in [torch.long, torch.int]:
             raise ValueError("Input must be token IDs (long or int tensor)")
         
+        # Get device from embedding layer
+        device = next(self.embedding_layer.parameters()).device
+        
         # Add batch dimension if needed
-        if input.dim() == 1:
-            input_batch = input.unsqueeze(0)
+        if input_ids.dim() == 1:
+            input_batch = input_ids.unsqueeze(0)
         else:
-            input_batch = input
+            input_batch = input_ids
         
         # Get embeddings
         input_embeds = self.embedding_layer(input_batch)
         
         # Get target class if not provided
         if target is None:
-            with torch.no_grad():
-                output = model(input_batch)
-                # Handle both tensor and dataclass outputs
-                if hasattr(output, 'logits'):
-                    logits = output.logits
-                else:
-                    logits = output
-                target = logits.argmax(dim=1).item()
+            # For base language models without classifier head, use first output dimension
+            # Users should specify target for meaningful results
+            target = 0
         
         # Create baseline embeddings
         baseline_embeds = self._get_baseline_embeds(input_batch)
@@ -310,7 +308,7 @@ class IntGradText:
             )
         
         # For text, each token is its own segment
-        segments = torch.arange(len(attributions), device=attributions.device)
+        segments = torch.arange(len(attributions), device=device)
         
         return IntGradExplanation(
             attributions=attributions,
@@ -358,11 +356,17 @@ class IntGradText:
             # Handle dataclass outputs
             if hasattr(output, 'logits'):
                 logits = output.logits
+            elif hasattr(output, 'last_hidden_state'):
+                # For base language models, use last hidden state
+                logits = output.last_hidden_state[:, -1, :]  # Last token
             else:
                 logits = output
             
             # Get gradient
             model.zero_grad()
+            # Handle case where target might be out of bounds for hidden states
+            if target >= logits.shape[-1]:
+                target = 0
             logits[0, target].backward()
             
             # Accumulate
@@ -390,6 +394,10 @@ class IntGradText:
             if hasattr(out_input, 'logits'):
                 input_output = out_input.logits[0, target]
                 baseline_output = out_baseline.logits[0, target]
+            elif hasattr(out_input, 'last_hidden_state'):
+                # For base language models
+                input_output = out_input.last_hidden_state[0, -1, target]
+                baseline_output = out_baseline.last_hidden_state[0, -1, target]
             else:
                 input_output = out_input[0, target]
                 baseline_output = out_baseline[0, target]
