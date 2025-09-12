@@ -102,8 +102,16 @@ class GroupSelectLayer(nn.Module):
 
     def init_weights(self):
         embed_dim = self.multihead_attn.embed_dim
-        identity_matrix = torch.eye(embed_dim)
-        self.multihead_attn.input_weights.data = identity_matrix[None].expand(3, embed_dim, embed_dim).reshape(-1, embed_dim)
+        W = self.multihead_attn.input_weights
+        identity_matrix = torch.eye(
+            W.shape[-1],
+            dtype=W.dtype,
+            device=W.device
+        )
+        self.multihead_attn.input_weights.data.copy_(identity_matrix[None].expand(3, W.shape[-1], W.shape[-1]).reshape(-1, W.shape[-1]))
+
+        # identity_matrix = torch.eye(embed_dim)
+        # self.multihead_attn.input_weights.data = identity_matrix[None].expand(3, embed_dim, embed_dim).reshape(-1, embed_dim)
 
     def forward(self, query, key, value):
         """
